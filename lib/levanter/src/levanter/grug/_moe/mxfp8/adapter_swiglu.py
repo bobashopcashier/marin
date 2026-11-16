@@ -8,7 +8,9 @@ Two calls carry the SwiGLU of a gated expert MLP, ``y = (silu(gate) * up) @ w2``
 
 - :func:`mxfp8_fused_swiglu`: ``x_q @ w13`` followed in the epilogue by SwiGLU and the MXFP8
   quantization of the hidden activation ``h`` in both orientations, storing the bf16
-  pre-activation for the backward.
+  pre-activation for the backward. :func:`mxfp8_fused_swiglu_forward` stores only what the next
+  forward GEMM reads, for a forward pass whose backward recomputes it. It runs the Marin subclass
+  of the kernel in :mod:`levanter.grug._moe.mxfp8.kernels`.
 - :func:`mxfp8_fused_dswiglu`: ``g_q @ w2^T`` followed by the SwiGLU backward against the saved
   pre-activation, the MXFP8 quantization of its result in both orientations, and each row's
   ``<h, dh>``.
@@ -53,6 +55,7 @@ from levanter.grug._moe.mxfp8.adapter import (
     _sf_row_bytes,
     _ones,
 )
+from levanter.grug._moe.mxfp8.kernels.swiglu_forward_only import SwigluKernel
 from levanter.grug._moe.mxfp8.layout import GATE_UP_BLOCK
 from levanter.grug._moe.mxfp8.quantize import MXFP8_BLOCK_SIZE
 
@@ -144,6 +147,88 @@ def _swiglu_launcher(*, expert_count, mma_tiler_mn, cluster_shape_mn, max_active
     return launcher
 
 
+@cute_launcher_factory
+def _swiglu_forward_launcher(*, expert_count, mma_tiler_mn, cluster_shape_mn, max_active_clusters):
+    """Signature: (stream, x, w13, sfx, sfw13, offs, alpha, prob, norm, h, sfh_row)."""
+
+    @cute.jit
+    def launcher(stream, mA, mB, mSFA, mSFB, mOffs, mAlpha, mProb, mNorm, mD, mSFDRow):
+        kernel = SwigluKernel(
+            sf_vec_size=MXFP8_BLOCK_SIZE,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=mma_tiler_mn[0] == _TWO_CTA_TILE_M,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            vector_f32=False,
+            generate_sfd=True,
+            discrete_col_sfd=False,
+            expert_cnt=expert_count,
+            forward_only=True,
+        )
+        kernel(
+            mA,
+            mB,
+            None,  # c: not stored
+            mD,
+            None,  # d_col: not stored
+            mSFA,
+            mSFB,
+            mSFDRow,
+            None,  # sfd_col: not stored
+            None,  # amax: only produced on the bf16-output path
+            mNorm,
+            mOffs,
+            mAlpha,
+            mProb,
+            max_active_clusters,
+            stream,
+        )
+
+    return launcher
+
+
+_SWIGLU_INPUT_SPEC = (_BATCH_LAST, _BATCH_LAST, _SPEC, _SPEC, _SPEC, _SPEC, _SPEC, _SPEC)
+
+
+def _swiglu_problem(x_q, x_sf, w13i_q, w13i_sf, offs) -> tuple[int, int, int]:
+    """Check the fused SwiGLU operands and return ``(rows, experts, intermediate)``."""
+    _require_sm100()
+    m, hidden = x_q.shape
+    experts, n2, k = w13i_q.shape
+    if k != hidden:
+        raise ValueError(f"contraction mismatch: x_q {x_q.shape}, w13i_q {w13i_q.shape}")
+    if n2 % (2 * GATE_UP_BLOCK):
+        raise ValueError(f"2I={n2} must be a multiple of {2 * GATE_UP_BLOCK} (32-column gate/up block pairs)")
+    _check_padded_rows(m, offs, experts)
+    _check_quantized(x_q, w13i_q)
+    _check_scales(x_sf, w13i_sf)
+    return m, experts, n2 // 2
+
+
+def _swiglu_inputs(x_q, x_sf, w13i_q, w13i_sf, offs, *, rows: int, experts: int) -> tuple[jax.Array, ...]:
+    """The fused SwiGLU kernels' inputs in ``_SWIGLU_INPUT_SPEC`` order, routing-weight knobs at 1."""
+    return (
+        _as_batch_last(x_q),
+        w13i_q,
+        x_sf.reshape(-1),
+        w13i_sf.reshape(-1),
+        offs.astype(jnp.int32),
+        _ones(experts),
+        jnp.ones((rows, 1, 1), jnp.float32),
+        _ones(1),
+    )
+
+
+def _swiglu_launcher_config(experts: int) -> dict:
+    mma_tiler_mn, cluster_shape_mn = _SWIGLU_TILING
+    return {
+        "expert_count": experts,
+        "mma_tiler_mn": mma_tiler_mn,
+        "cluster_shape_mn": cluster_shape_mn,
+        "max_active_clusters": _max_active_clusters(cluster_shape_mn),
+    }
+
+
 def mxfp8_fused_swiglu(x_q, x_sf, w13i_q, w13i_sf, offs) -> SwigluOutputs:
     """Fused forward w13: ``swiglu(x @ w13)`` with a dual-orientation MXFP8 epilogue.
 
@@ -159,48 +244,44 @@ def mxfp8_fused_swiglu(x_q, x_sf, w13i_q, w13i_sf, offs) -> SwigluOutputs:
         The interleaved pre-activation, both quantized copies of the SwiGLU output, and their
         scales; see :class:`SwigluOutputs`.
     """
-    _require_sm100()
-    m, hidden = x_q.shape
-    experts, n2, k = w13i_q.shape
-    if k != hidden:
-        raise ValueError(f"contraction mismatch: x_q {x_q.shape}, w13i_q {w13i_q.shape}")
-    if n2 % (2 * GATE_UP_BLOCK):
-        raise ValueError(f"2I={n2} must be a multiple of {2 * GATE_UP_BLOCK} (32-column gate/up block pairs)")
-    _check_padded_rows(m, offs, experts)
-    _check_quantized(x_q, w13i_q)
-    _check_scales(x_sf, w13i_sf)
-    intermediate = n2 // 2
-    mma_tiler_mn, cluster_shape_mn = _SWIGLU_TILING
-    launcher = _swiglu_launcher(
-        expert_count=experts,
-        mma_tiler_mn=mma_tiler_mn,
-        cluster_shape_mn=cluster_shape_mn,
-        max_active_clusters=_max_active_clusters(cluster_shape_mn),
-    )
+    m, experts, intermediate = _swiglu_problem(x_q, x_sf, w13i_q, w13i_sf, offs)
     call = cutlass_call(
-        launcher,
+        _swiglu_launcher(**_swiglu_launcher_config(experts)),
         output_shape_dtype=(
-            jax.ShapeDtypeStruct((1, m, n2), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, m, 2 * intermediate), jnp.bfloat16),
             jax.ShapeDtypeStruct((1, m, intermediate), jnp.float8_e4m3fn),
             jax.ShapeDtypeStruct((1, m, intermediate), jnp.float8_e4m3fn),
             jax.ShapeDtypeStruct((_sf_row_bytes(m, intermediate),), jnp.float8_e8m0fnu),
             jax.ShapeDtypeStruct((_sf_col_bytes(m, intermediate),), jnp.float8_e8m0fnu),
         ),
-        input_spec=(_BATCH_LAST, _BATCH_LAST, _SPEC, _SPEC, _SPEC, _SPEC, _SPEC, _SPEC),
+        input_spec=_SWIGLU_INPUT_SPEC,
         output_spec=(_BATCH_LAST, _BATCH_LAST, _BATCH_LAST, _SPEC, _SPEC),
         use_static_tensors=True,
     )
-    c13, h, h_col, sfh_row, sfh_col = call(
-        _as_batch_last(x_q),
-        w13i_q,
-        x_sf.reshape(-1),
-        w13i_sf.reshape(-1),
-        offs.astype(jnp.int32),
-        _ones(experts),
-        jnp.ones((m, 1, 1), jnp.float32),
-        _ones(1),
-    )
+    c13, h, h_col, sfh_row, sfh_col = call(*_swiglu_inputs(x_q, x_sf, w13i_q, w13i_sf, offs, rows=m, experts=experts))
     return SwigluOutputs(c13[0], h[0], h_col[0], sfh_row, sfh_col)
+
+
+def mxfp8_fused_swiglu_forward(x_q, x_sf, w13i_q, w13i_sf, offs):
+    """:func:`mxfp8_fused_swiglu`'s ``(h, h_scales)``, the down GEMM's operand, bit for bit.
+
+    The kernel skips the pre-activation and the token-quantized copy, which only the backward
+    reads, so a forward pass whose backward recomputes it writes neither. Arguments as for
+    :func:`mxfp8_fused_swiglu`.
+    """
+    m, experts, intermediate = _swiglu_problem(x_q, x_sf, w13i_q, w13i_sf, offs)
+    call = cutlass_call(
+        _swiglu_forward_launcher(**_swiglu_launcher_config(experts)),
+        output_shape_dtype=(
+            jax.ShapeDtypeStruct((1, m, intermediate), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((_sf_row_bytes(m, intermediate),), jnp.float8_e8m0fnu),
+        ),
+        input_spec=_SWIGLU_INPUT_SPEC,
+        output_spec=(_BATCH_LAST, _SPEC),
+        use_static_tensors=True,
+    )
+    h, sfh_row = call(*_swiglu_inputs(x_q, x_sf, w13i_q, w13i_sf, offs, rows=m, experts=experts))
+    return h[0], sfh_row
 
 
 # --------------------------------------------------------------------------- #

@@ -683,3 +683,34 @@ def test_fused_mxfp8_swiglu_legs_are_bitwise_identical_across_reruns(problem):
         identical = jax.tree.map(lambda a, b: bool(jnp.array_equal(_bits(a), _bits(b))), first, again)
         differing = [name for name, same in identical._asdict().items() if not same]
         assert not differing, f"rerun {rerun + 1} changed {differing}"
+
+
+# The hero chunk's 303,104 padded rows with skewed routing and an expert that gets no tokens.
+_SKEWED_HERO_PROBLEM = _Problem(hidden=3072, intermediate=3072, group_sizes=(182_000, 0, 121_000))
+_FORWARD_ONLY_PROBLEMS = [
+    *(pytest.param(problem, id=f"h{problem.hidden}-i{problem.intermediate}") for problem in _SWIGLU_SMALL_PROBLEMS),
+    pytest.param(_SKEWED_HERO_PROBLEM, id="hero-chunk-skewed", marks=pytest.mark.slow),
+]
+
+
+def _gate_up_operands(inputs: _SwigluInputs) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The gate/up GEMM's operands: row-quantized tokens and weights, with their swizzled scales."""
+    x, x_scale = _quantize(inputs.x, axis=1)
+    w13i, w13i_scale = _quantize(inputs.w13i, axis=2)
+    return x, _as_e8m0(_swizzle(x_scale)), w13i, _weight_scales(w13i_scale)
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("problem", _FORWARD_ONLY_PROBLEMS)
+def test_forward_only_swiglu_writes_the_upstream_kernels_h_and_row_scales_bitwise(problem):
+    # The full call runs upstream's kernel class and the forward-only call the Marin subclass, so
+    # this also holds the copied methods to upstream's output.
+    _adapter, adapter_swiglu = _require_swiglu_adapters()
+    operands = jax.jit(_gate_up_operands)(_make_swiglu_inputs(problem, seed=2))
+    offs = jnp.asarray(np.cumsum(_padded_sizes(problem)), jnp.int32)
+
+    _c13, h, _h_col, sfh_row, _sfh_col = jax.jit(adapter_swiglu.mxfp8_fused_swiglu)(*operands, offs)
+    h_forward, sfh_row_forward = jax.jit(adapter_swiglu.mxfp8_fused_swiglu_forward)(*operands, offs)
+
+    assert bool(jnp.array_equal(_bits(h_forward), _bits(h))), "h differs from the upstream kernel's"
+    assert bool(jnp.array_equal(_bits(sfh_row_forward), _bits(sfh_row))), "sfh_row differs from the upstream kernel's"

@@ -9,6 +9,8 @@ row before ``layout.group_ends[-1]``, the end of the last expert's received rows
 scales, but reads each received row of ``x`` once and writes each output once. The XLA composition
 writes the zeroed buffer to HBM, then reads it twice more, once per orientation. The grouped kernels
 stop at that end, so the programs past it write nothing, and the outputs there are unspecified.
+`quantize_rows_padded` is the same kernel with the token copy compiled out, for a forward pass that
+keeps no weight-gradient operands.
 
 Each program owns ``block_m`` padded rows and walks a run of 64-column tiles across them. Every
 row that was not received reads as zero, so the non-finite rows in the gaps between experts and
@@ -120,6 +122,7 @@ if triton is not None and tl is not None:
         inv_e4m3_max: tl.constexpr,
         min_exponent: tl.constexpr,
         max_exponent: tl.constexpr,
+        write_tokens: tl.constexpr,  # False compiles out the token copy; its pointers are then None
     ):
         groups: tl.constexpr = block_m // 32
         pid_m = tl.program_id(0)
@@ -176,25 +179,26 @@ if triton is not None and tl is not None:
                 )
                 tl.store(sfa_ptr + sfa_offset, row_exponent.to(tl.uint8))
 
-                token_amax = tl.max(tl.max(magnitude, axis=4), axis=2)  # [e, c, g, d]
-                token_exponent = _e8m0_exponent(token_amax, inv_e4m3_max, min_exponent, max_exponent)
-                q_tokens = x * _e8m0_reciprocal(token_exponent)[:, :, None, :, None, :]
-                tl.store(
-                    q_tokens_ptr + out_offsets + tile * block_h,
-                    q_tokens.to(tl.float8e4nv, fp_downcast_rounding="rtne"),
-                )
+                if write_tokens:
+                    token_amax = tl.max(tl.max(magnitude, axis=4), axis=2)  # [e, c, g, d]
+                    token_exponent = _e8m0_exponent(token_amax, inv_e4m3_max, min_exponent, max_exponent)
+                    q_tokens = x * _e8m0_reciprocal(token_exponent)[:, :, None, :, None, :]
+                    tl.store(
+                        q_tokens_ptr + out_offsets + tile * block_h,
+                        q_tokens.to(tl.float8e4nv, fp_downcast_rounding="rtne"),
+                    )
 
-                # The [H, Mp/32] (feature, token block) token-scale matrix swizzled whole, then tile p
-                # of the result is source tile block_perm[p]. A tile's 64 features lie in one 128-row tile.
-                feature = tile * block_h + sf_feature
-                dest_tile = tl.load(tile_dest_ptr + (tile // 2) * (padded_rows // sf_tile_rows) + token_block // 4)
-                sf_wgrad_offset = (
-                    dest_tile * sf_tile_bytes
-                    + (feature % 32) * 16
-                    + ((feature % sf_tile_rows) // 32) * 4
-                    + token_block % 4
-                )
-                tl.store(sf_wgrad_ptr + sf_wgrad_offset, token_exponent.to(tl.uint8))
+                    # The [H, Mp/32] (feature, token block) token-scale matrix swizzled whole, then tile p
+                    # of the result is source tile block_perm[p]. A tile's 64 features lie in one 128-row tile.
+                    feature = tile * block_h + sf_feature
+                    dest_tile = tl.load(tile_dest_ptr + (tile // 2) * (padded_rows // sf_tile_rows) + token_block // 4)
+                    sf_wgrad_offset = (
+                        dest_tile * sf_tile_bytes
+                        + (feature % 32) * 16
+                        + ((feature % sf_tile_rows) // 32) * 4
+                        + token_block % 4
+                    )
+                    tl.store(sf_wgrad_ptr + sf_wgrad_offset, token_exponent.to(tl.uint8))
 
 else:
     _dual_quantize_padded_kernel = None
@@ -216,6 +220,23 @@ def dual_quantize_padded(
     Raises unless Triton and a GPU are available. The kernel has no partitioning rule, so under a
     sharded mesh call it inside ``shard_map``.
     """
+    return DualQuantized(*_quantize_padded(x, layout, block_perm))
+
+
+def quantize_rows_padded(x: Float[Array, "Mp H"], layout: PaddedDispatch) -> tuple[Array, Array]:
+    """``(q_rows, sfa)`` of `dual_quantize_padded`, bit for bit, without the token-quantized copy.
+
+    The same kernel with the token copy compiled out, for a forward pass whose backward recomputes
+    it and so never reads the copy. Requirements as for `dual_quantize_padded`.
+    """
+    q_rows, sfa = _quantize_padded(x, layout, None)
+    return q_rows, sfa
+
+
+def _quantize_padded(
+    x: Float[Array, "Mp H"], layout: PaddedDispatch, block_perm: Int[Array, "tiles"] | None
+) -> tuple[Array, ...]:
+    """Both copies, or with no ``block_perm`` (the token scales' order) the row copy alone."""
     if not mxfp8_triton_quant_available():
         raise RuntimeError(
             "the MXFP8 Triton quantizer needs jax-triton, triton and a GPU; install the gpu extra for "
@@ -234,30 +255,43 @@ def dual_quantize_padded(
     if tile.block_m % (32 * tile.num_warps) != 0 or padded_rows % tile.block_m != 0:
         raise ValueError(f"tile {tile} does not split the {padded_rows} padded rows into whole warps")
     tiles = (hidden // SF_TILE_ROWS) * (padded_rows // SF_TILE_ROWS)
-    if block_perm.shape != (tiles,):
+    if block_perm is not None and block_perm.shape != (tiles,):
         raise ValueError(f"block_perm has shape {block_perm.shape}, expected ({tiles},)")
     column_tiles = hidden // _BLOCK_H
     tiles_per_program = max(n for n in range(1, tile.max_tiles_per_program + 1) if column_tiles % n == 0)
 
     source_row = jnp.where(layout.source_valid, jnp.arange(padded_rows, dtype=jnp.int32), -1)
-    tile_dest = (
-        jnp.zeros((tiles,), jnp.int32).at[block_perm].set(jnp.arange(tiles, dtype=jnp.int32), unique_indices=True)
+    row_outputs = (
+        jax.ShapeDtypeStruct((padded_rows, hidden), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((padded_rows, hidden // MXFP8_BLOCK_SIZE), jnp.uint8),
     )
-    q_rows, sfa, q_tokens, sf_wgrad = jt.triton_call(
+    write_tokens = block_perm is not None
+    if block_perm is not None:
+        tile_dest = (
+            jnp.zeros((tiles,), jnp.int32).at[block_perm].set(jnp.arange(tiles, dtype=jnp.int32), unique_indices=True)
+        )
+        token_outputs: tuple[jax.ShapeDtypeStruct, ...] = (
+            jax.ShapeDtypeStruct((padded_rows, hidden), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((hidden, padded_rows // MXFP8_BLOCK_SIZE), jnp.uint8),
+        )
+        token_pointers: dict[str, None] = {}
+    else:
+        # Only the token copy reads tile_dest, so it gets a placeholder, and the token copy's
+        # output pointers are compile-time None.
+        tile_dest = jnp.zeros((1,), jnp.int32)
+        token_outputs = ()
+        token_pointers = {"q_tokens_ptr": None, "sf_wgrad_ptr": None}
+    q_rows, sfa, *token_copy = jt.triton_call(
         x,
         source_row,
         tile_dest,
         layout.group_ends[-1:].astype(jnp.int32),
         kernel=_dual_quantize_padded_kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct((padded_rows, hidden), jnp.float8_e4m3fn),
-            jax.ShapeDtypeStruct((padded_rows, hidden // MXFP8_BLOCK_SIZE), jnp.uint8),
-            jax.ShapeDtypeStruct((padded_rows, hidden), jnp.float8_e4m3fn),
-            jax.ShapeDtypeStruct((hidden, padded_rows // MXFP8_BLOCK_SIZE), jnp.uint8),
-        ),
+        out_shape=(*row_outputs, *token_outputs),
         grid=(padded_rows // tile.block_m, column_tiles // tiles_per_program),
         num_warps=tile.num_warps,
         num_stages=1,
+        **token_pointers,
         h=hidden,
         padded_rows=padded_rows,
         block_m=tile.block_m,
@@ -268,11 +302,11 @@ def dual_quantize_padded(
         inv_e4m3_max=1.0 / E4M3_MAX,
         min_exponent=E8M0_MIN_EXPONENT,
         max_exponent=E8M0_MAX_EXPONENT,
+        write_tokens=write_tokens,
     )
     e8m0 = jnp.float8_e8m0fnu
-    return DualQuantized(
-        q_rows,
-        jax.lax.bitcast_convert_type(sfa, e8m0),
-        q_tokens,
-        jax.lax.bitcast_convert_type(sf_wgrad, e8m0),
-    )
+    row_copy = (q_rows, jax.lax.bitcast_convert_type(sfa, e8m0))
+    if not write_tokens:
+        return row_copy
+    q_tokens, sf_wgrad = token_copy
+    return (*row_copy, q_tokens, jax.lax.bitcast_convert_type(sf_wgrad, e8m0))

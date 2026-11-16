@@ -23,7 +23,7 @@ All six grouped GEMMs run in MXFP8:
 The residuals are the token-quantized copies the weight gradients read and the bf16 gate/up
 pre-activation the SwiGLU backward reads. The bf16 ``h`` is never stored. The weights are kept as
 given and quantized again along the axis each GEMM contracts over. ``apply``, the forward of a pass
-whose backward recomputes it, runs the forward's kernels and keeps none of the residuals.
+whose backward recomputes it, runs the same kernels without writing any of the residuals.
 
 The hero compiles with XLA GPU command buffers off (``--xla_gpu_enable_command_buffer=``, #5675).
 CUDA-graph replays of the forward and backward still match the program without command buffers
@@ -40,7 +40,11 @@ from jaxtyping import Array, Float, Int
 
 from levanter.grug._moe.ep_ragged_all_to_all import _RoutingWeightGradient
 from levanter.grug._moe.mxfp8.adapter import mxfp8_fused_gemm, mxfp8_fused_wgrad
-from levanter.grug._moe.mxfp8.adapter_swiglu import mxfp8_fused_dswiglu, mxfp8_fused_swiglu
+from levanter.grug._moe.mxfp8.adapter_swiglu import (
+    mxfp8_fused_dswiglu,
+    mxfp8_fused_swiglu,
+    mxfp8_fused_swiglu_forward,
+)
 from levanter.grug._moe.mxfp8.layout import (
     GROUP_PAD,
     PaddedDispatch,
@@ -50,7 +54,7 @@ from levanter.grug._moe.mxfp8.layout import (
     wgrad_block_perm,
 )
 from levanter.grug._moe.mxfp8.quantize import SF_TILE_ROWS, WeightMajor, quantize_weights
-from levanter.grug._moe.mxfp8.triton_quant import dual_quantize_padded
+from levanter.grug._moe.mxfp8.triton_quant import dual_quantize_padded, quantize_rows_padded
 
 # The swizzled scales tile SF_TILE_ROWS rows by 4 scales of 32 elements, so every GEMM dimension
 # the scales cover, H and I, must be a multiple of the tile height.
@@ -149,19 +153,20 @@ class _Mxfp8ExpertMlp:
         return out, residuals
 
     def apply(self, x_dispatch, moe_w13_local, moe_w2_local, physical_group_sizes, active_group_sizes):
-        """`forward`'s output, bit for bit, without its residuals.
+        """`forward`'s output, bit for bit, from kernels that skip what only the backward reads.
 
-        The returned ``h`` is the gate/up kernel's row-quantized output, the stage `forward`'s
-        residuals finish with.
+        The quantizer leaves out the token-quantized tokens and the gate/up kernel the pre-activation
+        and the token-quantized ``h``. The returned ``h`` is the gate/up kernel's row-quantized
+        output, the stage `forward`'s residuals finish with.
         """
         rows, hidden = x_dispatch.shape
         _check_feature_sizes(hidden, moe_w2_local.shape[1])
-        layout, block_perm = _aligned_layout(physical_group_sizes, active_group_sizes, rows=rows, hidden=hidden)
-        x_rows, x_rows_scales, _x_col, _x_col_scales = dual_quantize_padded(x_dispatch, layout, block_perm)
+        layout = aligned_dispatch_layout(physical_group_sizes, active_group_sizes, rows=rows)
+        x_rows, x_rows_scales = quantize_rows_padded(x_dispatch, layout)
         w13, w13_scales, w2, w2_scales = _forward_weights(moe_w13_local, moe_w2_local)
-        swiglu = mxfp8_fused_swiglu(x_rows, x_rows_scales, w13, w13_scales, layout.group_ends)
-        out = mxfp8_fused_gemm(swiglu.h, swiglu.h_scales, w2, w2_scales, layout.group_ends, b_major=WeightMajor.N)
-        return out, swiglu.h
+        h, h_scales = mxfp8_fused_swiglu_forward(x_rows, x_rows_scales, w13, w13_scales, layout.group_ends)
+        out = mxfp8_fused_gemm(h, h_scales, w2, w2_scales, layout.group_ends, b_major=WeightMajor.N)
+        return out, h
 
     def backward(self, residuals, cotangent):
         res = _Mxfp8Residuals(*residuals)

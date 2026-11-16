@@ -24,7 +24,7 @@ import pytest
 from levanter.grug._moe.ep_common import _aligned_receiver_rows, _receiver_group_spans
 from levanter.grug._moe.mxfp8.layout import GROUP_PAD, aligned_dispatch_layout, wgrad_block_perm
 from levanter.grug._moe.mxfp8.quantize import dual_quantize_activation
-from levanter.grug._moe.mxfp8.triton_quant import dual_quantize_padded
+from levanter.grug._moe.mxfp8.triton_quant import dual_quantize_padded, quantize_rows_padded
 from levanter.testing.devices import nvidia_compute_capability
 
 _OUTPUTS = ("q_rows", "sfa", "q_tokens", "sf_wgrad")
@@ -117,6 +117,7 @@ def _reference(x, received, block_perm):
 
 
 _kernel = jax.jit(dual_quantize_padded)
+_rows_kernel = jax.jit(quantize_rows_padded)
 
 
 def _assert_bitwise_equal(got, want, *, rows: int, rows_end: int):
@@ -126,7 +127,7 @@ def _assert_bitwise_equal(got, want, *, rows: int, rows_end: int):
     first in all four: the copies are row-major, and both scale layouts put those rows' tiles first.
     """
     assert len(got) == len(want), f"{len(got)} outputs, expected {len(want)}"
-    for name, g, w in zip(_OUTPUTS, got, want, strict=True):
+    for name, g, w in zip(_OUTPUTS[: len(want)], got, want, strict=True):
         assert (g.shape, g.dtype) == (w.shape, w.dtype), f"{name}: {g.dtype}{g.shape} vs {w.dtype}{w.shape}"
         prefix = w.size * rows_end // rows
         g_bytes = jax.lax.bitcast_convert_type(g, jnp.uint8).reshape(-1)[:prefix]
@@ -168,6 +169,14 @@ def _check(capacity: int, hidden: int, active_sizes: tuple[int, ...], seed: int)
     )
 
 
+def _check_rows(capacity: int, hidden: int, active_sizes: tuple[int, ...], seed: int):
+    x, layout, received, block_perm = _case(capacity, hidden, active_sizes, seed)
+    q_rows, sfa, _q_tokens, _sf_wgrad = _reference(x, received, block_perm)
+    _assert_bitwise_equal(
+        _rows_kernel(x, layout), (q_rows, sfa), rows=layout.padded_rows, rows_end=int(layout.group_ends[-1])
+    )
+
+
 _SMALL_CASES = [
     pytest.param(1000, 256, (300, 0, 513), id="zero-token-expert-gaps-and-tail"),
     pytest.param(768, 128, (256, 256, 256), id="full-capacity-no-gaps"),
@@ -183,6 +192,12 @@ def test_dual_quantize_padded_matches_reference_bitwise(capacity, hidden, active
     _check(capacity, hidden, active_sizes, seed=capacity + hidden)
 
 
+@pytest.mark.parametrize(("capacity", "hidden", "active_sizes"), _SMALL_CASES)
+def test_quantize_rows_padded_matches_reference_row_copy_bitwise(capacity, hidden, active_sizes):
+    _requires_gpu()
+    _check_rows(capacity, hidden, active_sizes, seed=capacity + hidden)
+
+
 @pytest.mark.slow
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
@@ -195,3 +210,11 @@ def test_dual_quantize_padded_matches_reference_bitwise(capacity, hidden, active
 def test_dual_quantize_padded_matches_reference_bitwise_at_large_chunk(active_sizes):
     _requires_gpu()
     _check(_LARGE_CAPACITY, _LARGE_HIDDEN, active_sizes, seed=sum(active_sizes))
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(600)
+def test_quantize_rows_padded_matches_reference_row_copy_bitwise_at_large_chunk():
+    _requires_gpu()
+    active_sizes = (182_000, 0, 117_500)  # skewed, an expert without rows, and a NaN/inf tail
+    _check_rows(_LARGE_CAPACITY, _LARGE_HIDDEN, active_sizes, seed=sum(active_sizes))
