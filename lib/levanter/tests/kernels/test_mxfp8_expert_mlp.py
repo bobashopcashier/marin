@@ -26,8 +26,10 @@ import pytest
 from levanter.grug._moe.ep_common import _aligned_receiver_rows, _receiver_group_spans
 from levanter.grug._moe.ep_ragged_all_to_all import _CuteExpertMlp, _RoutingWeightGradient
 from levanter.grug._moe.mxfp8.quantize import dequantize_mxfp8, quantize_mxfp8
+from levanter.testing.devices import nvidia_compute_capability
 
 _HIGHEST = jax.lax.Precision.HIGHEST
+_SM100_COMPUTE_CAPABILITY_MAJOR = 10
 # experiments/grug/moe_hero_ep/train.py: XLA_DISABLE_GPU_COMMAND_BUFFER_FLAG.
 _jit = functools.partial(jax.jit, compiler_options={"xla_gpu_enable_command_buffer": ""})
 # Captures the quantization fusions and the kernels' custom calls into one CUDA graph.
@@ -75,10 +77,9 @@ _WITH_HERO = [*_SMALL, pytest.param(_HERO_PROBLEM, id="hero-chunk", marks=pytest
 
 
 def _require_mxfp8_expert_mlp():
-    if jax.default_backend() != "gpu":
+    capability = nvidia_compute_capability()
+    if capability is None or int(capability) != _SM100_COMPUTE_CAPABILITY_MAJOR:
         pytest.skip("the MXFP8 expert MLP requires an SM100 GPU")
-    if int(float(jax.devices("gpu")[0].compute_capability)) != 10:
-        pytest.skip("the MXFP8 expert MLP requires SM100")
     pytest.importorskip("cutlass")
     pytest.importorskip("cudnn")
     pytest.importorskip("quack")
