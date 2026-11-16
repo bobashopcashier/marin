@@ -12,6 +12,7 @@ from fray.cluster import ResourceConfig
 from levanter.callbacks.profiler import ProfileOptionsConfig, ProfilerConfig
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointDebugConfig, CheckpointerConfig
+from levanter.grug.mxfp8 import ExpertMxfp8
 from levanter.tracker.wandb import WandbConfig
 from marin.execution.build_context import resolve_version
 from marin.execution.lazy import ArtifactStep, StepContext
@@ -100,6 +101,7 @@ def build_diagnostic_run(
     long_context_start_step: int | None = None,
     moe_implementation: str | None = None,
     ce_grad_in_forward_token_block_size: int | None = None,
+    expert_mxfp8: ExpertMxfp8 | None = None,
     master_param_mode: MasterParamMode = HERO_MASTER_PARAM_MODE,
     processes_per_task: int = HERO_PROCESSES_PER_TASK,
     eval_every: int = 0,
@@ -182,6 +184,7 @@ def build_diagnostic_run(
             ("log_scaling_power", log_scaling_power),
             ("moe_implementation", moe_implementation),
             ("ce_grad_in_forward_token_block_size", ce_grad_in_forward_token_block_size),
+            ("expert_mxfp8", expert_mxfp8),
         )
         if value is not None
     }
@@ -227,6 +230,7 @@ def build_diagnostic_run(
         raise AssertionError("the pooled-wave hero requires a transport capacity factor")
     backend_tag = model.moe_implementation.replace("_", "-")
     capacity_tag = f"capacity-{model.capacity_factor:g}"
+    mxfp8_tag = f"expert-mxfp8-{model.expert_mxfp8}"
     # Only the pooled transport has a receiver capacity of its own to report.
     transport_capacity_tags = (f"transport-capacity-{model.pooled_transport_capacity_factor:g}",) if pooled else ()
     wave_tag = f"expert-waves-{model.num_expert_waves}"
@@ -295,6 +299,7 @@ def build_diagnostic_run(
                     "ep",
                     backend_tag,
                     capacity_tag,
+                    mxfp8_tag,
                     f"master-params-{master_param_mode.value.replace('_', '-')}",
                     *transport_capacity_tags,
                     wave_tag,
@@ -461,6 +466,15 @@ def build_diagnostic_run(
     type=click.IntRange(min=1),
     default=None,
     help="Compute the training cross-entropy's gradients in its forward, in blocks of this many rows per rank.",
+)
+@click.option(
+    "--expert-mxfp8",
+    type=click.Choice([choice.value for choice in ExpertMxfp8]),
+    default=None,
+    help=(
+        "Override the routed-expert GEMMs that run in MXFP8. all requires the ragged_all_to_all backend on "
+        "SM100 GPUs. Defaults to the hero spec."
+    ),
 )
 @click.option(
     "--master-params",
@@ -651,6 +665,7 @@ def main(
     latent_dim: int | None,
     moe_implementation: str | None,
     ce_grad_in_forward_token_block_size: int | None,
+    expert_mxfp8: str | None,
     master_params: str,
     processes_per_task: int,
     save_checkpoints: bool,
@@ -703,6 +718,7 @@ def main(
         long_context_start_step=long_context_start_step,
         moe_implementation=moe_implementation,
         ce_grad_in_forward_token_block_size=ce_grad_in_forward_token_block_size,
+        expert_mxfp8=None if expert_mxfp8 is None else ExpertMxfp8(expert_mxfp8),
         master_param_mode=MasterParamMode(master_params),
         processes_per_task=processes_per_task,
         save_checkpoints=save_checkpoints,

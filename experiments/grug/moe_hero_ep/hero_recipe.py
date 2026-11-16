@@ -10,6 +10,7 @@ from levanter.callbacks.profiler import ProfilerConfig
 from levanter.callbacks.progress_watchdog import ProgressWatchdogConfig
 from levanter.callbacks.watch import WatchConfig
 from levanter.checkpoint import CheckpointerConfig
+from levanter.grug.mxfp8 import ExpertMxfp8
 from levanter.grug.sharding import compact_grug_mesh_shape
 from levanter.tracker import TrackerConfig
 from levanter.trainer import TrainerConfig
@@ -126,6 +127,10 @@ def validate_model_split(model: GrugModelConfig, *, context_axis_size: int, expe
             f"num_experts={model.num_experts} must be divisible by expert ({expert_axis_size}) * "
             f"context ({context_axis_size}) = {bank_shards}, the expert bank's storage split"
         )
+    # Without a second expert rank the ragged backend runs its local scatter path, which has no MXFP8
+    # expert MLP; `moe_mlp` would reject this only once the model is traced on the rack.
+    if model.expert_mxfp8 != ExpertMxfp8.NONE and expert_axis_size < 2:
+        raise ValueError(f"expert_mxfp8={model.expert_mxfp8} requires expert_axis_size >= 2, got {expert_axis_size}")
     local_experts = model.num_experts // expert_axis_size
     if model.moe_implementation == "fixed_pooled_wave_all_to_all" and local_experts % model.num_expert_waves != 0:
         raise ValueError(

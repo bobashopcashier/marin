@@ -463,6 +463,7 @@ The selected E384 model runs at expert width 3072 and receiver capacity factor 1
 | `--batch-size` | sets global sequences per step and the optimizer token budget; the default holds one hero rack's 4,194,304 tokens at the sequence length |
 | `--seq-len` | sets sequence length; the optimizer uses the resulting token budget |
 | `--context-axis-size`, `--expert-axis-size` | divide each rack between context and expert parallelism |
+| `--expert-mxfp8` | selects the routed-expert GEMMs that run in MXFP8 (default: the hero's `none`); `all` requires the ragged transport on SM100 GPUs and raises everywhere else |
 | `--qk-mult`, `--qk-mult-long-scale` | multiply Q before attention; `--qk-mult` sets every layer (default: the hero's 1.66), and `--qk-mult-long-scale` multiplies it on the global full-causal layers only (default 1) |
 | `--log-scaling-n-floor` | scales each global-layer query that sees `n` keys in its document by `(1 + alpha * ln(max(n / this value, 1))) ** power`, on top of the QK options; must be below the sequence length, since no query is scaled otherwise |
 | `--log-scaling-alpha` | the slope `alpha` of that scale; unset keeps the hero's 0.1 |

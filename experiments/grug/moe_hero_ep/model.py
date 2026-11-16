@@ -35,6 +35,7 @@ from levanter.grug._moe.common import (
     _zero_dropped_assignments,
     padding_skipped_assignments,
 )
+from levanter.grug._moe.mxfp8.quantize import SF_TILE_ROWS
 from levanter.grug._moe.topk import top_k_indices
 from levanter.grug.attention import (
     DEFAULT_CONTEXT_ATTENTION_LAYOUT,
@@ -55,6 +56,7 @@ from levanter.grug.grug_moe import (
     MOE_SENDER_DROPPED_ASSIGNMENTS_METRIC,
     MOE_SKIPPED_PADDING_ASSIGNMENTS_METRIC,
     MOE_VALID_ASSIGNMENTS_METRIC,
+    ExpertMxfp8,
     MoeActivation,
     MoEExpertMlp,
     MoEExpertMlpPspecs,
@@ -356,6 +358,9 @@ class GrugModelConfig:
     context shards at the cost of a query swap and a second kernel launch per call; it pays off at 262K
     but costs 0.7% at 65K, where the hero should use "contiguous". See README "Context-length switches"."""
     moe_implementation: MoeImplementation | None = None
+    expert_mxfp8: ExpertMxfp8 = ExpertMxfp8.NONE
+    """The routed-expert GEMMs that run in MXFP8. ``ALL`` requires the ragged_all_to_all backend on
+    SM100 GPUs; parameters stay in the same dtype and layout either way."""
     expert_chunks: int = 1
     pooled_transport_capacity_factor: float | None = None
     num_expert_waves: int = 1
@@ -427,6 +432,21 @@ class GrugModelConfig:
             and self.pooled_transport_capacity_factor is None
         ):
             raise ValueError(f"{self.moe_implementation} requires pooled_transport_capacity_factor")
+        if self.expert_mxfp8 != ExpertMxfp8.NONE and self.moe_implementation != "ragged_all_to_all":
+            # `moe_mlp` rejects this too, but only once the model is traced on the allocated devices.
+            raise ValueError(
+                f"expert_mxfp8={self.expert_mxfp8} requires moe_implementation='ragged_all_to_all', "
+                f"got {self.moe_implementation!r}"
+            )
+        if self.expert_mxfp8 == ExpertMxfp8.ALL:
+            # The MXFP8 kernels' swizzled scales tile both expert GEMM widths; the expert MLP checks this
+            # too, but only once the model is traced on the allocated devices.
+            expert_width = self.latent_dim if self.latent_dim is not None else self.hidden_dim
+            if expert_width % SF_TILE_ROWS or self.intermediate_dim % SF_TILE_ROWS:
+                raise ValueError(
+                    f"expert_mxfp8={self.expert_mxfp8} requires an expert width and intermediate_dim that "
+                    f"are multiples of {SF_TILE_ROWS}; got {expert_width} and {self.intermediate_dim}"
+                )
         if self.num_expert_waves <= 0:
             raise ValueError("num_expert_waves must be positive")
         if self.num_shared_experts <= 0:
@@ -1123,6 +1143,7 @@ class MoEMLP(eqx.Module):
                 pooled_transport_capacity_factor=cfg.pooled_transport_capacity_factor,
                 expert_chunks=cfg.expert_chunks,
                 num_expert_waves=cfg.num_expert_waves,
+                ragged_expert_mxfp8=cfg.expert_mxfp8,
                 pspecs=MoEExpertMlpPspecs(expert=_EXPERT_WEIGHT_AXES),
             ),
             cfg=cfg,
