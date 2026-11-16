@@ -60,6 +60,7 @@ from levanter.grug._moe.ep_ring import (
 )
 from levanter.grug._moe.ep_ring_filtered import _moe_mlp_ep_ring_filtered_local
 from levanter.grug._moe.local import _moe_mlp_local
+from levanter.grug.mxfp8 import ExpertMxfp8
 from levanter.grug.sharding import (
     _axis_names,
     _token_spec_from_x,
@@ -369,6 +370,7 @@ class MoEExpertMlp(eqx.Module):
     pooled_transport_capacity_factor: float | None = eqx.field(static=True, default=None)
     expert_chunks: int = eqx.field(static=True, default=1)
     num_expert_waves: int = eqx.field(static=True, default=1)
+    ragged_expert_mxfp8: ExpertMxfp8 = eqx.field(static=True, default=ExpertMxfp8.NONE)
 
     @staticmethod
     def init(
@@ -385,6 +387,7 @@ class MoEExpertMlp(eqx.Module):
         pooled_transport_capacity_factor: float | None = None,
         expert_chunks: int = 1,
         num_expert_waves: int = 1,
+        ragged_expert_mxfp8: ExpertMxfp8 = ExpertMxfp8.NONE,
         pspecs: MoEExpertMlpPspecs = MoEExpertMlpPspecs(),
     ) -> "MoEExpertMlp":
         resolved_implementation = resolve_moe_implementation(implementation)
@@ -408,6 +411,7 @@ class MoEExpertMlp(eqx.Module):
             pooled_transport_capacity_factor=pooled_transport_capacity_factor,
             expert_chunks=expert_chunks,
             num_expert_waves=num_expert_waves,
+            ragged_expert_mxfp8=ragged_expert_mxfp8,
         )
 
     @named_call
@@ -437,6 +441,7 @@ class MoEExpertMlp(eqx.Module):
             report_capacity_overflow=report_capacity_overflow,
             expert_chunks=self.expert_chunks,
             num_expert_waves=self.num_expert_waves,
+            ragged_expert_mxfp8=self.ragged_expert_mxfp8,
         )
 
 
@@ -457,6 +462,7 @@ def moe_mlp(
     report_capacity_overflow: bool = False,
     expert_chunks: int = 1,
     num_expert_waves: int = 1,
+    ragged_expert_mxfp8: ExpertMxfp8 = ExpertMxfp8.NONE,
 ) -> Float[Array, "T D"] | tuple[Float[Array, "T D"], MoeDispatchCounts]:
     """Functional routed MoE MLP core used by Grug modules and benchmarks.
 
@@ -482,6 +488,11 @@ def moe_mlp(
     projection's backward as `<hidden, dhidden> / w`: zero at a zero weight and
     rounded like the bfloat16 hidden activations. Every other path, float16
     included, differentiates the combine weights exactly.
+
+    `ragged_expert_mxfp8` selects the routed-expert GEMMs that run with MXFP8 operands
+    (`ExpertMxfp8`). `ALL` runs only on `ragged_all_to_all` over an expert axis of size two or
+    more, for SiLU experts and bfloat16 tokens on an SM100 GPU with the MXFP8 expert MLP
+    installed. Any other `ALL` call raises rather than running the experts in another format.
 
     Set `report_capacity_overflow=True` to also return sender and receiver
     capacity drops plus padding-skipped assignment counts.
@@ -543,6 +554,20 @@ def moe_mlp(
     has_expert_axis = _mesh_has_axis(mesh, "expert")
     expert_axis_size = _mesh_axis_size(mesh, "expert")
 
+    if ragged_expert_mxfp8 != ExpertMxfp8.NONE:
+        # Only the ragged backend has an MXFP8 expert MLP, and it runs only under expert parallelism.
+        if resolved_implementation != "ragged_all_to_all":
+            raise ValueError(
+                f"ragged_expert_mxfp8={ragged_expert_mxfp8} requires implementation='ragged_all_to_all'; "
+                f"got implementation={resolved_implementation!r}"
+            )
+        if expert_axis_size < 2:
+            raise ValueError(
+                f"ragged_expert_mxfp8={ragged_expert_mxfp8} requires an expert axis of size two or more, because "
+                "ragged_all_to_all runs the local scatter path without one; "
+                f"got expert axis size={expert_axis_size}"
+            )
+
     if mesh is None or mesh.empty:
         out, dropped = _moe_mlp_local(
             x,
@@ -599,7 +624,7 @@ def moe_mlp(
                 transport_capacity_factor=pooled_transport_capacity_factor,
             )
         elif resolved_implementation == "ragged_all_to_all":
-            shard_local_fn = _moe_mlp_ep_ragged_a2a_local
+            shard_local_fn = partial(_moe_mlp_ep_ragged_a2a_local, mxfp8=ragged_expert_mxfp8)
         elif resolved_implementation == "fixed_all_to_all":
             shard_local_fn = _moe_mlp_ep_fixed_a2a_local
         elif resolved_implementation == "fixed_pooled_wave_all_to_all":
@@ -720,6 +745,7 @@ def moe_mlp(
 
 
 __all__ = [
+    "ExpertMxfp8",
     "MOE_DROPPED_ASSIGNMENTS_METRIC",
     "MOE_SENDER_DROPPED_ASSIGNMENTS_METRIC",
     "MOE_RECEIVER_DROPPED_ASSIGNMENTS_METRIC",

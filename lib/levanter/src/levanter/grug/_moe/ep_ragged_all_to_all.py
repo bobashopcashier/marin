@@ -55,10 +55,13 @@ from levanter.grug._moe.ep_common import (
     _receiver_group_spans,
     _sort_activations,
 )
+from levanter.grug._moe.mxfp8.triton_quant import mxfp8_triton_quant_available
+from levanter.grug.mxfp8 import ExpertMxfp8
 
 logger = logging.getLogger(__name__)
 
-# QuACK's grouped GEMMs are written for SM100 and ship only with the CUDA 13 GPU extra.
+# QuACK's grouped GEMMs and the MXFP8 expert MLP's block-scaled GEMMs are written for SM100, and
+# ship only with the CUDA 13 GPU extra.
 _SM100_COMPUTE_CAPABILITY = 10.0
 
 # Sequential local-expert chunks per MoE layer; capacity splits evenly across chunks. Falls
@@ -244,8 +247,8 @@ class _CuteExpertMlp:
         return dx, _deinterleave_gate_up(dw13_interleaved), dw2, output_dot_cotangent
 
 
-@functools.cache
-def _quack_grouped_gemm_available() -> bool:
+def _sm100_gpu_present() -> bool:
+    """Whether this process's GPU is an NVIDIA SM100 (Blackwell) or newer device."""
     if jax.default_backend() != "gpu":
         return False
     device = jax.devices("gpu")[0]
@@ -253,7 +256,12 @@ def _quack_grouped_gemm_available() -> bool:
     # a gfx architecture name such as "gfx942".
     if "nvidia" not in device.device_kind.lower():
         return False
-    if float(device.compute_capability) < _SM100_COMPUTE_CAPABILITY:
+    return float(device.compute_capability) >= _SM100_COMPUTE_CAPABILITY
+
+
+@functools.cache
+def _quack_grouped_gemm_available() -> bool:
+    if not _sm100_gpu_present():
         return False
     try:
         # `sonic_cute` pulls in `quack_moe_cute`, which imports QuACK's varlen entry points at
@@ -270,12 +278,50 @@ def _quack_grouped_gemm_available() -> bool:
     return True
 
 
-def _select_expert_mlp(activation_fn: Callable[[jax.Array], jax.Array], dtype: jnp.dtype) -> _ExpertMlp:
-    """Pick the fastest expert-MLP kernel this process can actually run, and its routing-weight gradient.
+def _select_mxfp8_expert_mlp(activation_fn: Callable[[jax.Array], jax.Array], dtype: jnp.dtype) -> _ExpertMlp:
+    """The MXFP8 expert MLP, or an error naming the requirement this call does not meet."""
+    if activation_fn is not jax.nn.silu:
+        raise ValueError(
+            "ragged_expert_mxfp8=all requires SiLU experts, because the MXFP8 expert MLP fuses SwiGLU; "
+            f"got activation {activation_fn!r}"
+        )
+    if dtype != jnp.bfloat16:
+        raise ValueError(f"ragged_expert_mxfp8=all requires bfloat16 tokens; got {jnp.dtype(dtype).name}")
+    if not _sm100_gpu_present():
+        raise ValueError(
+            "ragged_expert_mxfp8=all requires an NVIDIA SM100 (Blackwell) or newer GPU; "
+            f"got device {jax.devices()[0].device_kind!r}"
+        )
+    try:
+        # The MXFP8 kernels need CUTLASS DSL, which is installed only with the CUDA 13 GPU extra.
+        from levanter.grug._moe.mxfp8.expert_mlp import _Mxfp8ExpertMlp  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            f"ragged_expert_mxfp8=all was requested, but the MXFP8 expert MLP is not available: {exc}"
+        ) from exc
+    if not mxfp8_triton_quant_available():
+        raise ImportError(
+            "ragged_expert_mxfp8=all was requested, but the MXFP8 expert MLP's Triton quantizer is not "
+            "available: it needs jax-triton and triton, from levanter's gpu extra"
+        )
+    return _Mxfp8ExpertMlp(routing_weight_gradient=_RoutingWeightGradient.EXPERT_SIDE)
 
-    QuACK's kernel fuses SwiGLU, so it only applies to SiLU. Everything else -- another
-    activation, a non-SM100 GPU, a TPU or CPU, or a build without the GPU extra -- runs the
-    portable `ragged_dot` path, which computes the same function.
+
+def _select_expert_mlp(
+    activation_fn: Callable[[jax.Array], jax.Array], dtype: jnp.dtype, mxfp8: ExpertMxfp8
+) -> _ExpertMlp:
+    """Pick the expert-MLP kernel for ``mxfp8``, and its routing-weight gradient.
+
+    ``ExpertMxfp8.NONE`` picks the fastest kernel in the tokens' dtype that this process can
+    actually run. QuACK's kernel fuses SwiGLU, so it only applies to SiLU. Everything else --
+    another activation, a non-SM100 GPU, a TPU or CPU, or a build without the GPU extra -- runs
+    the portable `ragged_dot` path, which computes the same function.
+
+    ``ExpertMxfp8.ALL`` is an explicit request for the MXFP8 expert MLP, which runs only for SiLU
+    experts on bfloat16 tokens on an SM100 GPU, and takes the expert-side gradient. Any other
+    activation, dtype, or device, an MXFP8 expert MLP that does not import, or a missing Triton
+    for its quantizer, raises: a bfloat16 kernel in its place would train in a number format other
+    than the one requested.
 
     ``dtype`` is the tokens' dtype, which the expert outputs and their cotangents share. The
     expert-side gradient divides ``<h, dh>`` by ``w``, and ``dh`` comes from the row cotangent
@@ -292,6 +338,8 @@ def _select_expert_mlp(activation_fn: Callable[[jax.Array], jax.Array], dtype: j
     buffer and the return transport. It takes the exact gradient, which holds for every weight and
     dtype.
     """
+    if mxfp8 == ExpertMxfp8.ALL:
+        return _select_mxfp8_expert_mlp(activation_fn, dtype)
     if activation_fn is jax.nn.silu and _quack_grouped_gemm_available():
         if dtype == jnp.float16:
             return _CuteExpertMlp(routing_weight_gradient=_RoutingWeightGradient.EXACT)
@@ -782,6 +830,7 @@ def _moe_mlp_ep_ragged_a2a_local(
     num_experts: int,
     capacity_factor: float,
     token_sharding_axes: tuple[str, ...],
+    mxfp8: ExpertMxfp8,
 ) -> tuple[Float[Array, "Tlocal H"], CapacityDrops]:
     local_experts = moe_w13_local.shape[0]
     if num_experts % local_experts != 0:
@@ -855,7 +904,7 @@ def _moe_mlp_ep_ragged_a2a_local(
         ep_size=ep_size,
         chunk_experts=chunk_experts,
         chunk_capacity=chunk_capacity,
-        expert_mlp=_select_expert_mlp(activation_fn, x_local.dtype),
+        expert_mlp=_select_expert_mlp(activation_fn, x_local.dtype, mxfp8),
     )
     # A dropped or padding assignment gets weight zero, so the combine never reads its unwritten
     # row, and the `where` discards any gradient for it.

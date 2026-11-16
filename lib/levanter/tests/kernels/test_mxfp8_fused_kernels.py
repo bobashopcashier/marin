@@ -1,11 +1,13 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Numerics and determinism of the cudnn-frontend MXFP8 grouped GEMM and weight-gradient kernels (SM100).
+"""Numerics and determinism of the cudnn-frontend MXFP8 grouped kernels (SM100).
 
 Each kernel is checked against per-expert f32 matmuls on the dequantized operands it consumes, so
 the comparison isolates the kernel from quantization noise. The operands are quantized here by an
-independent implementation of the MXFP8 rule and the SM100 scale layouts.
+independent implementation of the MXFP8 rule and the SM100 scale layouts. Quantized outputs are
+checked after dequantizing both the kernel's bytes and scales and an independent reference
+quantization of the f32 reference result.
 """
 
 import functools
@@ -33,6 +35,10 @@ _E8M0_NAN_BYTE = 0xFF
 # precision. The kernels accumulate in f32, so the measured errors are 1e-4 or less.
 _GEMM_TOLERANCE = 1e-3
 _WGRAD_TOLERANCE = 2e-3
+_QUANTIZED_TOLERANCE = 2e-3
+_DPROB_TOLERANCE = 2e-2
+# Width of the gate and up column blocks the fused SwiGLU epilogue pairs.
+_GATE_UP_BLOCK = 32
 
 
 class _Problem(NamedTuple):
@@ -386,3 +392,294 @@ def test_mxfp8_grouped_gemm_and_wgrad_do_not_read_rows_past_the_last_experts_end
     assert with_tail.y.shape[0] == rows + 2 * GROUP_PAD
     assert bool(jnp.array_equal(_bits(with_tail.y[:rows]), _bits(exact.y)))
     assert bool(jnp.array_equal(_bits(with_tail.dw), _bits(exact.dw)))
+
+
+# --------------------------------------------------------------------------- #
+# the six legs of a SwiGLU expert MLP
+# --------------------------------------------------------------------------- #
+
+# One expert gets no tokens; the intermediate sizes give 2 and 3 dSwiGLU column tiles.
+_SWIGLU_SMALL_PROBLEMS = [
+    _Problem(hidden=256, intermediate=512, group_sizes=(300, 0, 1000, 213)),
+    _Problem(hidden=512, intermediate=768, group_sizes=(700, 512, 0)),
+]
+_SWIGLU_PROBLEMS = [
+    *(pytest.param(problem, id=f"h{problem.hidden}-i{problem.intermediate}") for problem in _SWIGLU_SMALL_PROBLEMS),
+    pytest.param(_HERO_PROBLEM, id="hero-chunk", marks=pytest.mark.slow),
+]
+
+
+def _require_swiglu_adapters():
+    return _require_sm100(), importlib.import_module("levanter.grug._moe.mxfp8.adapter_swiglu")
+
+
+class _SwigluInputs(NamedTuple):
+    x: jax.Array  # (M, H) bf16, padding rows zero
+    g: jax.Array  # (M, H) bf16 output cotangent, padding rows zero
+    w13i: jax.Array  # (E, 2I, H) bf16, gate/up interleaved in 32-column blocks
+    w2: jax.Array  # (E, I, H) bf16
+
+
+class _SwigluOperands(NamedTuple):
+    x: jax.Array
+    x_sf: jax.Array
+    x_col: jax.Array
+    x_col_sf: jax.Array
+    g: jax.Array
+    g_sf: jax.Array
+    g_col: jax.Array
+    g_col_sf: jax.Array
+    # Every weight K-major, (E, N, K) quantized along K.
+    w13i: jax.Array  # (E, 2I, H), the gate/up GEMM's
+    w13i_sf: jax.Array
+    w2f: jax.Array  # (E, H, I), the down GEMM's
+    w2f_sf: jax.Array
+    w2: jax.Array  # (E, I, H), the down data gradient's
+    w2_sf: jax.Array
+    w13dg: jax.Array  # (E, H, 2I), the gate/up data gradient's
+    w13dg_sf: jax.Array
+
+
+def _make_swiglu_inputs(problem: _Problem, seed: int) -> _SwigluInputs:
+    padded = _padded_sizes(problem)
+    valid = np.concatenate([np.arange(p) < s for s, p in zip(problem.group_sizes, padded, strict=True)])
+    valid = jnp.asarray(valid)[:, None]
+    experts, hidden, intermediate = len(padded), problem.hidden, problem.intermediate
+    kx, kg, k13, k2 = jax.random.split(jax.random.key(seed), 4)
+    rows = sum(padded)
+    x = jnp.where(valid, jax.random.normal(kx, (rows, hidden), jnp.bfloat16), 0)
+    g = jnp.where(valid, jax.random.normal(kg, (rows, hidden), jnp.bfloat16), 0)
+    w13i = (jax.random.normal(k13, (experts, 2 * intermediate, hidden), jnp.float32) / hidden**0.5).astype(
+        jnp.bfloat16
+    )
+    w2 = (jax.random.normal(k2, (experts, intermediate, hidden), jnp.float32) / intermediate**0.5).astype(jnp.bfloat16)
+    return _SwigluInputs(x=x, g=g, w13i=w13i, w2=w2)
+
+
+def _quantize_swiglu_operands(inputs: _SwigluInputs, padded_sizes: tuple[int, ...]) -> _SwigluOperands:
+    def rows(t):
+        q, scale = _quantize(t, axis=1)
+        return q, _as_e8m0(_swizzle(scale))
+
+    def columns(t):
+        q, scale = _quantize(t, axis=0)
+        return q, _column_scales(scale, padded_sizes)
+
+    def weight(w):
+        q, scale = _quantize(w, axis=2)
+        return q, _weight_scales(scale)
+
+    return _SwigluOperands(
+        *rows(inputs.x),
+        *columns(inputs.x),
+        *rows(inputs.g),
+        *columns(inputs.g),
+        *weight(inputs.w13i),
+        *weight(jnp.swapaxes(inputs.w2, 1, 2)),
+        *weight(inputs.w2),
+        *weight(jnp.swapaxes(inputs.w13i, 1, 2)),
+    )
+
+
+class _SwigluOutputs(NamedTuple):
+    c13: jax.Array
+    h: jax.Array
+    h_col: jax.Array
+    sfh_row: jax.Array
+    sfh_col: jax.Array
+    y: jax.Array
+    dc: jax.Array
+    dc_col: jax.Array
+    sfdc_row: jax.Array
+    sfdc_col: jax.Array
+    dprob: jax.Array
+    dx: jax.Array
+    dw13i: jax.Array
+    dw2: jax.Array
+
+
+def _run_swiglu_legs(adapters, padded_sizes: tuple[int, ...], ops: _SwigluOperands) -> _SwigluOutputs:
+    adapter, adapter_swiglu = adapters
+    offs = jnp.asarray(np.cumsum(padded_sizes), jnp.int32)
+    n2 = ops.w13i.shape[1]
+    k_major = WeightMajor.K
+    c13, h, h_col, sfh_row, sfh_col = adapter_swiglu.mxfp8_fused_swiglu(ops.x, ops.x_sf, ops.w13i, ops.w13i_sf, offs)
+    y = adapter.mxfp8_fused_gemm(h, sfh_row, ops.w2f, ops.w2f_sf, offs, b_major=k_major)
+    dc, dc_col, sfdc_row, sfdc_col, dprob = adapter_swiglu.mxfp8_fused_dswiglu(
+        ops.g, ops.g_sf, ops.w2, ops.w2_sf, c13, offs
+    )
+    dx = adapter.mxfp8_fused_gemm(dc, sfdc_row, ops.w13dg, ops.w13dg_sf, offs, b_major=k_major)
+    dw13i = adapter.mxfp8_fused_wgrad(ops.x_col, ops.x_col_sf, dc_col, sfdc_col.reshape(n2, -1), offs)
+    dw2 = adapter.mxfp8_fused_wgrad(h_col, sfh_col.reshape(n2 // 2, -1), ops.g_col, ops.g_col_sf, offs)
+    return _SwigluOutputs(c13, h, h_col, sfh_row, sfh_col, y, dc, dc_col, sfdc_row, sfdc_col, dprob, dx, dw13i, dw2)
+
+
+def _swiglu(c):
+    blocks = c.reshape(*c.shape[:-1], -1, 2, _GATE_UP_BLOCK)
+    gate = blocks[..., 0, :].reshape(*c.shape[:-1], -1)
+    up = blocks[..., 1, :].reshape(*c.shape[:-1], -1)
+    return jax.nn.silu(gate) * up
+
+
+def _dequantize_k_major_weight(q, sf):
+    experts, n, k = q.shape
+    scale = jnp.stack([_unswizzle(sf[e], n, k // _SF_VEC) for e in range(experts)])
+    return _dequantize(q, scale, axis=2)
+
+
+class _SwigluReferences(NamedTuple):
+    """f32 reference of each kernel output, computed from the operands that kernel consumed."""
+
+    c13: jax.Array
+    h: jax.Array
+    y: jax.Array
+    dc: jax.Array
+    dprob: jax.Array
+    dx: jax.Array
+    dw13i: jax.Array
+    dw2: jax.Array
+
+
+def _swiglu_references(padded_sizes: tuple[int, ...], ops: _SwigluOperands, out: _SwigluOutputs) -> _SwigluReferences:
+    def matmul(a, w):
+        # a (M, K) against K-major weights (E, N, K).
+        return _grouped_matmul(a, jnp.swapaxes(w, 1, 2), padded_sizes)
+
+    x = _dequantize_rows(ops.x, ops.x_sf)
+    g = _dequantize_rows(ops.g, ops.g_sf)
+    x_col = _dequantize_columns(ops.x_col, ops.x_col_sf, padded_sizes)
+    g_col = _dequantize_columns(ops.g_col, ops.g_col_sf, padded_sizes)
+    w13i = _dequantize_k_major_weight(ops.w13i, ops.w13i_sf)
+    w2f = _dequantize_k_major_weight(ops.w2f, ops.w2f_sf)
+    w2 = _dequantize_k_major_weight(ops.w2, ops.w2_sf)
+    w13dg = _dequantize_k_major_weight(ops.w13dg, ops.w13dg_sf)
+    # Downstream legs consume the kernels' own quantized intermediates.
+    h = _dequantize_rows(out.h, out.sfh_row)
+    h_col = _dequantize_columns(out.h_col, out.sfh_col, padded_sizes)
+    dc = _dequantize_rows(out.dc, out.sfdc_row)
+    dc_col = _dequantize_columns(out.dc_col, out.sfdc_col, padded_sizes)
+
+    c13_ref = matmul(x, w13i)
+    dh = matmul(g, w2)
+    # The dSwiGLU epilogue reads the bf16 pre-activation the forward kernel stored.
+    c13 = out.c13.astype(jnp.float32)
+    _, swiglu_pullback = jax.vjp(_swiglu, c13)
+    (dc_ref,) = swiglu_pullback(dh)
+    return _SwigluReferences(
+        c13=c13_ref,
+        h=_swiglu(c13_ref),
+        y=matmul(h, w2f),
+        dc=dc_ref,
+        dprob=jnp.sum(_swiglu(c13) * dh, axis=-1),
+        dx=matmul(dc, w13dg),
+        dw13i=_grouped_wgrad(x_col, dc_col, padded_sizes),
+        dw2=_grouped_wgrad(h_col, g_col, padded_sizes),
+    )
+
+
+class _RoundedSwigluReferences(NamedTuple):
+    """The references in the output's precision: bf16 for GEMM outputs, MXFP8 (values, scales) otherwise."""
+
+    c13: jax.Array
+    y: jax.Array
+    dx: jax.Array
+    dw13i: jax.Array
+    dw2: jax.Array
+    h_rows: tuple[jax.Array, jax.Array]
+    h_cols: tuple[jax.Array, jax.Array]
+    dc_rows: tuple[jax.Array, jax.Array]
+    dc_cols: tuple[jax.Array, jax.Array]
+    dprob: jax.Array
+
+
+def _round_swiglu_references(ref: _SwigluReferences) -> _RoundedSwigluReferences:
+    return _RoundedSwigluReferences(
+        c13=ref.c13.astype(jnp.bfloat16),
+        y=ref.y.astype(jnp.bfloat16),
+        dx=ref.dx.astype(jnp.bfloat16),
+        dw13i=ref.dw13i.astype(jnp.bfloat16),
+        dw2=ref.dw2.astype(jnp.bfloat16),
+        h_rows=_quantize(ref.h, axis=1),
+        h_cols=_quantize(ref.h, axis=0),
+        dc_rows=_quantize(ref.dc, axis=1),
+        dc_cols=_quantize(ref.dc, axis=0),
+        dprob=ref.dprob,
+    )
+
+
+def _swiglu_leg_errors(
+    padded_sizes: tuple[int, ...], out: _SwigluOutputs, ref: _RoundedSwigluReferences
+) -> dict[str, jax.Array]:
+    """Relative Frobenius error of every kernel output against its rounded reference."""
+    return {
+        "c13": _relative_error(out.c13, ref.c13),
+        "y": _relative_error(out.y, ref.y),
+        "dx": _relative_error(out.dx, ref.dx),
+        "dw13i": _relative_error(out.dw13i, ref.dw13i),
+        "dw2": _relative_error(out.dw2, ref.dw2),
+        "h": _relative_error(_dequantize_rows(out.h, out.sfh_row), _dequantize(*ref.h_rows, axis=1)),
+        "h_col": _relative_error(
+            _dequantize_columns(out.h_col, out.sfh_col, padded_sizes), _dequantize(*ref.h_cols, axis=0)
+        ),
+        "dc": _relative_error(_dequantize_rows(out.dc, out.sfdc_row), _dequantize(*ref.dc_rows, axis=1)),
+        "dc_col": _relative_error(
+            _dequantize_columns(out.dc_col, out.sfdc_col, padded_sizes), _dequantize(*ref.dc_cols, axis=0)
+        ),
+        "dprob": _relative_error(out.dprob, ref.dprob),
+    }
+
+
+_SWIGLU_TOLERANCES = {
+    "c13": _GEMM_TOLERANCE,
+    "y": _GEMM_TOLERANCE,
+    "dx": _GEMM_TOLERANCE,
+    "h": _QUANTIZED_TOLERANCE,
+    "h_col": _QUANTIZED_TOLERANCE,
+    "dc": _QUANTIZED_TOLERANCE,
+    "dc_col": _QUANTIZED_TOLERANCE,
+    "dw13i": _QUANTIZED_TOLERANCE,
+    "dw2": _QUANTIZED_TOLERANCE,
+    "dprob": _DPROB_TOLERANCE,
+}
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("problem", _SWIGLU_PROBLEMS)
+def test_fused_mxfp8_swiglu_legs_match_dequantized_f32_reference(problem):
+    adapters = _require_swiglu_adapters()
+    padded = _padded_sizes(problem)
+    operands = jax.jit(functools.partial(_quantize_swiglu_operands, padded_sizes=padded))(
+        _make_swiglu_inputs(problem, seed=0)
+    )
+    out = jax.jit(functools.partial(_run_swiglu_legs, adapters, padded))(operands)
+    references = jax.jit(functools.partial(_swiglu_references, padded))(operands, out)
+    rounded = jax.jit(_round_swiglu_references)(references)
+    del references
+    errors = jax.jit(functools.partial(_swiglu_leg_errors, padded))(out, rounded)
+    errors = {name: float(value) for name, value in errors.items()}
+    print(f"{problem}: " + ", ".join(f"{name}={value:.3e}" for name, value in errors.items()))
+
+    failures = {name: value for name, value in errors.items() if not value < _SWIGLU_TOLERANCES[name]}
+    assert not failures, f"legs over tolerance: {failures} (tolerances {_SWIGLU_TOLERANCES})"
+
+    for expert, size in enumerate(problem.group_sizes):
+        if size == 0:
+            assert not np.any(np.asarray(out.dw13i[expert])), f"expert {expert} has no tokens but a nonzero dw13"
+            assert not np.any(np.asarray(out.dw2[expert])), f"expert {expert} has no tokens but a nonzero dw2"
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("problem", _SWIGLU_PROBLEMS)
+def test_fused_mxfp8_swiglu_legs_are_bitwise_identical_across_reruns(problem):
+    adapters = _require_swiglu_adapters()
+    padded = _padded_sizes(problem)
+    operands = jax.jit(functools.partial(_quantize_swiglu_operands, padded_sizes=padded))(
+        _make_swiglu_inputs(problem, seed=1)
+    )
+    run = jax.jit(functools.partial(_run_swiglu_legs, adapters, padded))
+    first = run(operands)
+    for rerun in range(2):
+        again = run(operands)
+        identical = jax.tree.map(lambda a, b: bool(jnp.array_equal(_bits(a), _bits(b))), first, again)
+        differing = [name for name, same in identical._asdict().items() if not same]
+        assert not differing, f"rerun {rerun + 1} changed {differing}"

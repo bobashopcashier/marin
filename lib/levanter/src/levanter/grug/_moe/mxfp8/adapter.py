@@ -3,7 +3,9 @@
 
 """JAX entry points for the cudnn-frontend MXFP8 MoE grouped GEMMs (SM100 only).
 
-The kernels come from the nvidia-cudnn-frontend package (``cudnn.gemm.cutedsl.grouped``).
+The kernels come from the nvidia-cudnn-frontend package (``cudnn.gemm.cutedsl.grouped``). This
+module holds the two without an activation and what every wrapper shares; :mod:`.adapter_swiglu`
+holds the GEMMs with a fused SwiGLU epilogue.
 
 - :func:`mxfp8_fused_gemm`: a grouped GEMM with a bf16 epilogue.
 - :func:`mxfp8_fused_wgrad`: the grouped weight gradient from two token-axis quantized operands.
@@ -76,6 +78,26 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _round_up(a: int, b: int) -> int:
     return _ceil_div(a, b) * b
+
+
+def _sf_row_bytes(rows: int, features: int) -> int:
+    """Byte count of a row-orientation swizzled scale tensor for a ``(rows, features)`` operand."""
+    return _round_up(rows, SF_TILE_ROWS) * _round_up(_ceil_div(features, MXFP8_BLOCK_SIZE), 4)
+
+
+def _sf_col_bytes(rows: int, features: int) -> int:
+    """Byte count of a column-orientation (per-expert, token-axis) scale tensor for ``(rows, features)``."""
+    return _round_up(features, SF_TILE_ROWS) * _round_up(_ceil_div(rows, MXFP8_BLOCK_SIZE), 4)
+
+
+def _dprob_slot_count(n: int, tiling: tuple[tuple[int, int], tuple[int, int]]) -> int:
+    """Routing-gradient slots per row of an ``n``-column output: one per N tile the scheduler can emit.
+
+    The scheduler counts whole clusters along N, so the count rounds up to a multiple of the
+    cluster's N extent (upstream's ``dsrelu.api._dprob_n_slots``).
+    """
+    (_tile_m, tile_n), (_cluster_m, cluster_n) = tiling
+    return _ceil_div(n, tile_n * cluster_n) * cluster_n
 
 
 def _require_sm100() -> None:

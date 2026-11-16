@@ -16,7 +16,7 @@ neither read nor write the buffer's unused capacity past it.
 from typing import NamedTuple
 
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Int
+from jaxtyping import Array, Bool, Float, Int
 
 from levanter.grug._moe.ep_common import _aligned_group_sizes
 from levanter.grug._moe.mxfp8.quantize import SF_TILE_ROWS
@@ -24,6 +24,8 @@ from levanter.grug._moe.mxfp8.quantize import SF_TILE_ROWS
 # Every expert's rows start on a multiple of this in the kernel-facing buffer (the fused kernels'
 # FIX_PAD_SIZE).
 GROUP_PAD = 256
+# Width of the gate and up column blocks the fused SwiGLU epilogue pairs.
+GATE_UP_BLOCK = 32
 
 
 class PaddedDispatch(NamedTuple):
@@ -97,3 +99,24 @@ def wgrad_block_perm(padded_group_sizes: Int[Array, "E"], *, rows: int, total_to
     width = expert_token_blocks[expert]
     tile = (within_expert // width) * token_blocks + token_block_starts[expert] + within_expert % width
     return tile.astype(jnp.int32)
+
+
+def interleave_gate_up_blocks(w13: Float[Array, "... I2"]) -> Float[Array, "... I2"]:
+    """Interleave gate and up columns in blocks of 32: ``[g[0:32], u[0:32], g[32:64], u[32:64], ...]``.
+
+    ``w13`` holds the gate columns ``[:I]`` and then the up columns ``[I:]``, as grug stores them.
+    The fused SwiGLU kernels take this order, so each 32-column epilogue block pairs a gate block
+    with its up block.
+    """
+    *lead, i2 = w13.shape
+    assert i2 % (2 * GATE_UP_BLOCK) == 0, f"gate/up width {i2} is not a multiple of {2 * GATE_UP_BLOCK}"
+    halves = w13.reshape(*lead, 2, i2 // (2 * GATE_UP_BLOCK), GATE_UP_BLOCK)
+    return jnp.swapaxes(halves, -3, -2).reshape(w13.shape)
+
+
+def deinterleave_gate_up_blocks(w13_interleaved: Float[Array, "... I2"]) -> Float[Array, "... I2"]:
+    """Inverse of `interleave_gate_up_blocks`, e.g. for a weight gradient over interleaved columns."""
+    *lead, i2 = w13_interleaved.shape
+    assert i2 % (2 * GATE_UP_BLOCK) == 0, f"gate/up width {i2} is not a multiple of {2 * GATE_UP_BLOCK}"
+    blocks = w13_interleaved.reshape(*lead, i2 // (2 * GATE_UP_BLOCK), 2, GATE_UP_BLOCK)
+    return jnp.swapaxes(blocks, -3, -2).reshape(w13_interleaved.shape)

@@ -9,7 +9,13 @@ import pytest
 import jax.numpy as jnp
 
 from levanter.grug._moe.ep_common import _aligned_receiver_rows, _receiver_group_spans
-from levanter.grug._moe.mxfp8.layout import GROUP_PAD, aligned_dispatch_layout, wgrad_block_perm
+from levanter.grug._moe.mxfp8.layout import (
+    GROUP_PAD,
+    aligned_dispatch_layout,
+    deinterleave_gate_up_blocks,
+    interleave_gate_up_blocks,
+    wgrad_block_perm,
+)
 from levanter.grug._moe.mxfp8.quantize import (
     WeightMajor,
     build_sfb,
@@ -154,6 +160,20 @@ def test_quantize_weights_in_their_stored_layout_matches_quantizing_the_contract
 
     np.testing.assert_array_equal(_bytes(n_major), np.swapaxes(_bytes(k_major), 1, 2))
     np.testing.assert_array_equal(_bytes(n_major_scales), _bytes(k_major_scales))
+
+
+def test_interleave_gate_up_blocks_alternates_32_column_blocks_and_inverts():
+    experts, hidden, intermediate = 2, 3, 96
+    rng = np.random.default_rng(5)
+    w13 = rng.standard_normal((experts, hidden, 2 * intermediate)).astype(np.float32)
+    column = np.arange(2 * intermediate)
+    is_up = (column % 64) >= 32
+    source = (column // 64) * 32 + column % 32 + is_up * intermediate
+
+    interleaved = interleave_gate_up_blocks(jnp.asarray(w13))
+
+    np.testing.assert_array_equal(np.asarray(interleaved), w13[..., source])
+    np.testing.assert_array_equal(np.asarray(deinterleave_gate_up_blocks(interleaved)), w13)
 
 
 def test_quantize_mxfp8_rounds_scaled_values_half_to_even():
