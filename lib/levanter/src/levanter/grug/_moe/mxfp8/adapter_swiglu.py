@@ -51,7 +51,7 @@ from levanter.grug._moe.mxfp8.adapter import (
     _require_sm100,
     _sf_col_bytes,
     _sf_row_bytes,
-    _unit_vector,
+    _ones,
 )
 from levanter.grug._moe.mxfp8.layout import GATE_UP_BLOCK
 from levanter.grug._moe.mxfp8.quantize import MXFP8_BLOCK_SIZE
@@ -196,9 +196,9 @@ def mxfp8_fused_swiglu(x_q, x_sf, w13i_q, w13i_sf, offs) -> SwigluOutputs:
         x_sf.reshape(-1),
         w13i_sf.reshape(-1),
         offs.astype(jnp.int32),
-        _unit_vector(experts),
+        _ones(experts),
         jnp.ones((m, 1, 1), jnp.float32),
-        _unit_vector(1),
+        _ones(1),
     )
     return SwigluOutputs(c13[0], h[0], h_col[0], sfh_row, sfh_col)
 
@@ -336,10 +336,10 @@ def mxfp8_fused_dswiglu(g_q, g_sf, w2_q, w2_sf, c13, offs) -> DSwigluOutputs:
         g_sf.reshape(-1),
         w2_sf.reshape(-1),
         offs.astype(jnp.int32),
-        _unit_vector(experts),
-        _unit_vector(experts),
+        _ones(experts),
+        _ones(experts),
         jnp.ones((m, 1, 1), jnp.float32),
-        _unit_vector(1),
+        _ones(1),
         jnp.zeros((m, slots, 1), jnp.float32),
     )
     return DSwigluOutputs(dc[0], dc_col[0], sfdc_row, sfdc_col, jnp.sum(dprob_slots[:, :, 0], axis=-1))
